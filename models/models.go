@@ -80,6 +80,10 @@ const (
 
 	BounceTypeHard = "hard"
 	BounceTypeSoft = "soft"
+
+	// Templates.
+	TemplateTypeCampaign = "campaign"
+	TemplateTypeTx       = "tx"
 )
 
 // Headers represents an array of string maps used to represent SMTP, HTTP headers etc.
@@ -295,6 +299,7 @@ type Template struct {
 	Base
 
 	Name      string `db:"name" json:"name"`
+	Type      string `db:"type" json:"type"`
 	Body      string `db:"body" json:"body,omitempty"`
 	IsDefault bool   `db:"is_default" json:"is_default"`
 }

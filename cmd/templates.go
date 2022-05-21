@@ -63,10 +63,15 @@ func handlePreviewTemplate(c echo.Context) error {
 
 		id, _ = strconv.Atoi(c.Param("id"))
 		body  = c.FormValue("body")
+		typ   = c.FormValue("typ")
 	)
 
+	if typ == "" {
+		typ = models.TemplateTypeCampaign
+	}
+
 	if body != "" {
-		if !regexpTplTag.MatchString(body) {
+		if typ == models.TemplateTypeCampaign && !regexpTplTag.MatchString(body) {
 			return echo.NewHTTPError(http.StatusBadRequest,
 				app.i18n.Ts("templates.placeholderHelp", "placeholder", tplTag))
 		}
@@ -123,7 +128,7 @@ func handleCreateTemplate(c echo.Context) error {
 		return err
 	}
 
-	out, err := app.core.CreateTemplate(o.Name, []byte(o.Body))
+	out, err := app.core.CreateTemplate(o.Name, o.Type, []byte(o.Body))
 	if err != nil {
 		return err
 	}
@@ -152,7 +157,7 @@ func handleUpdateTemplate(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 	}
 
-	out, err := app.core.UpdateTemplate(id, o.Name, []byte(o.Body))
+	out, err := app.core.UpdateTemplate(id, o.Name, o.Type, []byte(o.Body))
 	if err != nil {
 		return err
 	}
@@ -203,7 +208,7 @@ func validateTemplate(o models.Template, app *App) error {
 		return errors.New(app.i18n.T("campaigns.fieldInvalidName"))
 	}
 
-	if !regexpTplTag.MatchString(o.Body) {
+	if o.Type == models.TemplateTypeCampaign && !regexpTplTag.MatchString(o.Body) {
 		return echo.NewHTTPError(http.StatusBadRequest,
 			app.i18n.Ts("templates.placeholderHelp", "placeholder", tplTag))
 	}

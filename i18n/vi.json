@@ -204,6 +204,7 @@
     "globals.terms.tags": "Thẻ",
     "globals.terms.template": "Template | Templates",
     "globals.terms.templates": "Mẫu",
+    "globals.terms.tx": "Transactional | Transactional",
     "globals.terms.year": "Year | Years",
     "import.alreadyRunning": "Quá trình nhập đang chạy. Chờ quá trình hoàn tất hoặc dừng trước khi thử lại.",
     "import.blocklist": "Danh sách chặn",

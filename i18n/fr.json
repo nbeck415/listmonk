@@ -204,6 +204,7 @@
     "globals.terms.tags": "Étiquettes",
     "globals.terms.template": "Modèle | Modèles",
     "globals.terms.templates": "Modèles",
+    "globals.terms.tx": "Transactional | Transactional",
     "globals.terms.year": "Année | Années",
     "import.alreadyRunning": "Une importation est déjà en cours. Attendez qu'elle se termine ou arrêtez-la avant de réessayer.",
     "import.blocklist": "Bloquer les adresses importées",

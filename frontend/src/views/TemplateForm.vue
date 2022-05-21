@@ -11,22 +11,36 @@
             <h4 v-else>{{ $t('templates.newTemplate') }}</h4>
         </header>
         <section expanded class="modal-card-body">
-            <b-field :label="$t('globals.fields.name')" label-position="on-border">
-              <b-input :maxlength="200" :ref="'focus'" v-model="form.name" name="name"
-                  :placeholder="$t('globals.fields.name')" required />
-            </b-field>
+          <div class="columns">
+            <div class="column is-9">
+              <b-field :label="$t('globals.fields.name')" label-position="on-border">
+                <b-input :maxlength="200" :ref="'focus'" v-model="form.name" name="name"
+                    :placeholder="$t('globals.fields.name')" required />
+              </b-field>
+            </div>
+            <div class="column is-3">
+              <b-field :label="$t('globals.fields.type')" label-position="on-border">
+                <b-select v-model="form.type" expanded>
+                  <option value="campaign">{{ $tc('globals.terms.campaign') }}</option>
+                  <option value="tx">{{ $tc('globals.terms.tx') }}</option>
+                </b-select>
+              </b-field>
+            </div>
+          </div>
 
-            <b-field v-if="form.body !== null"
-              :label="$t('templates.rawHTML')" label-position="on-border">
-              <html-editor v-model="form.body" name="body" />
-            </b-field>
+          <b-field v-if="form.body !== null"
+            :label="$t('templates.rawHTML')" label-position="on-border">
+            <html-editor v-model="form.body" name="body" />
+          </b-field>
 
-            <p class="is-size-7">
+          <p class="is-size-7">
+            <template v-if="form.type === 'campaign'">
               {{ $t('templates.placeholderHelp', { placeholder: egPlaceholder }) }}
-              <a target="_blank" href="https://listmonk.app/docs/templating">
-                {{ $t('globals.buttons.learnMore') }}
-              </a>
-            </p>
+            </template>
+            <a target="_blank" href="https://listmonk.app/docs/templating">
+              {{ $t('globals.buttons.learnMore') }}
+            </a>
+          </p>
         </section>
         <footer class="modal-card-foot has-text-right">
             <b-button @click="$parent.close()">{{ $t('globals.buttons.close') }}</b-button>
@@ -65,7 +79,7 @@ export default Vue.extend({
       // Binds form input values.
       form: {
         name: '',
-        type: '',
+        type: 'campaign',
         optin: '',
         body: null,
       },
@@ -96,6 +110,7 @@ export default Vue.extend({
       const data = {
         id: this.data.id,
         name: this.form.name,
+        type: this.form.type,
         body: this.form.body,
       };
 
@@ -110,6 +125,7 @@ export default Vue.extend({
       const data = {
         id: this.data.id,
         name: this.form.name,
+        type: this.form.type,
         body: this.form.body,
       };
 
