@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"html/template"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -124,13 +125,20 @@ func handleCreateTemplate(c echo.Context) error {
 		return err
 	}
 
-	if err := validateTemplate(o, app); err != nil {
+	tpl, err := validateTemplate(o, app)
+	if err != nil {
 		return err
 	}
 
-	out, err := app.core.CreateTemplate(o.Name, o.Type, []byte(o.Body))
+	b := []byte(o.Body)
+	out, err := app.core.CreateTemplate(o.Name, o.Type, b)
 	if err != nil {
 		return err
+	}
+
+	// If it's a transactional template, cache it.
+	if o.Type == models.TemplateTypeTx {
+		app.manager.CacheTxTemplate(out.ID, tpl)
 	}
 
 	return c.JSON(http.StatusOK, okResp{out})
@@ -153,13 +161,19 @@ func handleUpdateTemplate(c echo.Context) error {
 		return err
 	}
 
-	if err := validateTemplate(o, app); err != nil {
+	tpl, err := validateTemplate(o, app)
+	if err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 	}
 
 	out, err := app.core.UpdateTemplate(id, o.Name, o.Type, []byte(o.Body))
 	if err != nil {
 		return err
+	}
+
+	// If it's a transactional template, cache it.
+	if o.Type == models.TemplateTypeTx {
+		app.manager.CacheTxTemplate(out.ID, tpl)
 	}
 
 	return c.JSON(http.StatusOK, okResp{out})
@@ -199,19 +213,27 @@ func handleDeleteTemplate(c echo.Context) error {
 		return err
 	}
 
+	// Delete cached template.
+	app.manager.DeleteTxTemplate(id)
+
 	return c.JSON(http.StatusOK, okResp{true})
 }
 
 // validateTemplate validates template fields.
-func validateTemplate(o models.Template, app *App) error {
+func validateTemplate(o models.Template, app *App) (*template.Template, error) {
 	if !strHasLen(o.Name, 1, stdInputMaxLen) {
-		return errors.New(app.i18n.T("campaigns.fieldInvalidName"))
+		return nil, errors.New(app.i18n.T("campaigns.fieldInvalidName"))
 	}
 
 	if o.Type == models.TemplateTypeCampaign && !regexpTplTag.MatchString(o.Body) {
-		return echo.NewHTTPError(http.StatusBadRequest,
+		return nil, echo.NewHTTPError(http.StatusBadRequest,
 			app.i18n.Ts("templates.placeholderHelp", "placeholder", tplTag))
 	}
 
-	return nil
+	tpl, err := template.New("template").Parse(o.Body)
+	if err != nil {
+		return nil, echo.NewHTTPError(http.StatusBadRequest, app.i18n.T("templates.errorCompiling"))
+	}
+
+	return tpl, nil
 }

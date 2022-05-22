@@ -325,6 +325,25 @@ type Bounce struct {
 	Total int `db:"total" json:"-"`
 }
 
+// TxMessage represents an e-mail campaign.
+type TxMessage struct {
+	Subject     string      `db:"subject" json:"subject"`
+	FromEmail   string      `db:"from_email" json:"from_email"`
+	Body        string      `db:"body" json:"body"`
+	AltBody     null.String `db:"altbody" json:"altbody"`
+	Status      string      `db:"status" json:"status"`
+	ContentType string      `db:"content_type" json:"content_type"`
+	Headers     Headers     `db:"headers" json:"headers"`
+	TemplateID  int         `db:"template_id" json:"template_id"`
+	Messenger   string      `db:"messenger" json:"messenger"`
+
+	// TemplateBody is joined in from templates by the next-campaigns query.
+	TemplateBody string             `db:"template_body" json:"-"`
+	Tpl          *template.Template `json:"-"`
+	SubjectTpl   *txttpl.Template   `json:"-"`
+	AltBodyTpl   *template.Template `json:"-"`
+}
+
 // markdown is a global instance of Markdown parser and renderer.
 var markdown = goldmark.New(
 	goldmark.WithParserOptions(

@@ -60,6 +60,9 @@ type Manager struct {
 	campRates map[int]*ratecounter.RateCounter
 	campsMut  sync.RWMutex
 
+	tpls    map[int]*template.Template
+	tplsMut sync.RWMutex
+
 	// Links generated using Track() are cached here so as to not query
 	// the database for the link UUID for every message sent. This has to
 	// be locked as it may be used externally when previewing campaigns.
@@ -161,6 +164,7 @@ func New(cfg Config, store Store, notifCB models.AdminNotifCallback, i *i18n.I18
 		messengers:         make(map[string]messenger.Messenger),
 		camps:              make(map[int]*models.Campaign),
 		campRates:          make(map[int]*ratecounter.RateCounter),
+		tpls:               make(map[int]*template.Template),
 		links:              make(map[string]string),
 		subFetchQueue:      make(chan *models.Campaign, cfg.Concurrency),
 		campMsgQueue:       make(chan CampaignMessage, cfg.Concurrency*2),
@@ -296,6 +300,42 @@ func (m *Manager) Run() {
 			m.sendNotif(newC, newC.Status, "")
 		}
 	}
+}
+
+// CacheTxTemplate compiles and caches a transactional template.
+func (m *Manager) CacheTxTemplate(id int, tpl *template.Template) {
+	f := template.FuncMap{
+		"Date": func(layout string) string {
+			if layout == "" {
+				layout = time.ANSIC
+			}
+			return time.Now().Format(layout)
+		},
+		"L": func() *i18n.I18n {
+			return m.i18n
+		},
+		"Safe": func(safeHTML string) template.HTML {
+			return template.HTML(safeHTML)
+		},
+	}
+
+	for k, v := range sprig.GenericFuncMap() {
+		f[k] = v
+	}
+
+	// Add the functions.
+	tpl.Funcs(f)
+
+	m.tplsMut.Lock()
+	m.tpls[id] = tpl
+	m.tplsMut.Unlock()
+}
+
+// DeleteTxTemplate deletes a cached template.
+func (m *Manager) DeleteTxTemplate(id int) {
+	m.tplsMut.Lock()
+	delete(m.tpls, id)
+	m.tplsMut.Unlock()
 }
 
 // worker is a blocking function that perpetually listents to events (message) on different

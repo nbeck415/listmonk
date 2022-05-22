@@ -162,7 +162,7 @@ export default Vue.extend({
     },
 
     cloneTemplate(name, t) {
-      const data = { name, body: t.body };
+      const data = { name, body: t.body, type: t.type };
       this.$api.createTemplate(data).then((d) => {
         this.$api.getTemplates();
         this.$emit('finished');
