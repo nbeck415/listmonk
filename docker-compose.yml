@@ -43,6 +43,8 @@ services:
   app:
     <<: *app-defaults
     container_name: listmonk_app
+    labels:
+      shipyard.route: '/'
     depends_on:
       - db
     volumes:
