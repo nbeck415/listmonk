@@ -9,6 +9,8 @@ x-app-defaults: &app-defaults
   image: listmonk/listmonk:latest
   ports:
     - "9000:9000"
+  labels:
+    shipyard.route: '/'
   networks:
     - listmonk
   environment:
@@ -43,8 +45,6 @@ services:
   app:
     <<: *app-defaults
     container_name: listmonk_app
-    labels:
-      shipyard.route: '/'
     depends_on:
       - db
     volumes:
