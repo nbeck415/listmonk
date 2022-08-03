@@ -55,7 +55,7 @@ SELECT id as subscriber_id,
 WITH sub AS (
     INSERT INTO subscribers (uuid, email, name, status, attribs)
     VALUES($1, $2, $3, $4, $5)
-    returning id, status
+    RETURNING id, status
 ),
 listIDs AS (
     SELECT id FROM lists WHERE
@@ -128,12 +128,17 @@ WITH s AS (
 ),
 d AS (
     DELETE FROM subscriber_lists WHERE subscriber_id = $1 AND list_id != ALL($6)
+),
+listIDs AS (
+    SELECT id FROM lists WHERE
+        (CASE WHEN CARDINALITY($6::INT[]) > 0 THEN id=ANY($6)
+              ELSE uuid=ANY($7::UUID[]) END)
 )
 INSERT INTO subscriber_lists (subscriber_id, list_id, status)
     VALUES(
         (SELECT id FROM s),
-        UNNEST($6),
-        (CASE WHEN $4='blocklisted' THEN 'unsubscribed'::subscription_status ELSE $7::subscription_status END)
+        UNNEST(ARRAY(SELECT id FROM listIDs)),
+        (CASE WHEN $4='blocklisted' THEN 'unsubscribed'::subscription_status ELSE $8::subscription_status END)
     )
     ON CONFLICT (subscriber_id, list_id) DO UPDATE
     SET status = (CASE WHEN $4='blocklisted' THEN 'unsubscribed'::subscription_status ELSE subscriber_lists.status END);
@@ -569,27 +574,28 @@ u AS (
 )
 SELECT * FROM camps;
 
--- name: get-campaign-view-counts
--- raw: true
--- %s = * or DISTINCT subscriber_id (prepared based on based on individual tracking=on/off). Prepared on boot.
+-- name: get-campaign-analytics-unique-counts
 WITH intval AS (
     -- For intervals < a week, aggregate counts hourly, otherwise daily.
     SELECT CASE WHEN (EXTRACT (EPOCH FROM ($3::TIMESTAMP - $2::TIMESTAMP)) / 86400) >= 7 THEN 'day' ELSE 'hour' END
-)
-SELECT campaign_id, COUNT(%s) AS "count", DATE_TRUNC((SELECT * FROM intval), created_at) AS "timestamp"
-    FROM campaign_views
+),
+uniqIDs AS (
+    SELECT DISTINCT ON(subscriber_id) subscriber_id, campaign_id, DATE_TRUNC((SELECT * FROM intval), created_at) AS "timestamp"
+    FROM %s
     WHERE campaign_id=ANY($1) AND created_at >= $2 AND created_at <= $3
-    GROUP BY campaign_id, "timestamp" ORDER BY "timestamp" ASC;
+    ORDER BY subscriber_id, "timestamp"
+)
+SELECT COUNT(*) AS "count", campaign_id, "timestamp"
+    FROM uniqIDs GROUP BY campaign_id, "timestamp";
 
--- name: get-campaign-click-counts
+-- name: get-campaign-analytics-counts
 -- raw: true
--- %s = * or DISTINCT subscriber_id (prepared based on based on individual tracking=on/off). Prepared on boot.
 WITH intval AS (
     -- For intervals < a week, aggregate counts hourly, otherwise daily.
     SELECT CASE WHEN (EXTRACT (EPOCH FROM ($3::TIMESTAMP - $2::TIMESTAMP)) / 86400) >= 7 THEN 'day' ELSE 'hour' END
 )
-SELECT campaign_id, COUNT(%s) AS "count", DATE_TRUNC((SELECT * FROM intval), created_at) AS "timestamp"
-    FROM link_clicks
+SELECT campaign_id, COUNT(*) AS "count", DATE_TRUNC((SELECT * FROM intval), created_at) AS "timestamp"
+    FROM %s
     WHERE campaign_id=ANY($1) AND created_at >= $2 AND created_at <= $3
     GROUP BY campaign_id, "timestamp" ORDER BY "timestamp" ASC;
 
@@ -746,24 +752,25 @@ DELETE FROM users WHERE $1 != 1 AND id=$1;
 -- templates
 -- name: get-templates
 -- Only if the second param ($2) is true, body is returned.
-SELECT id, name, (CASE WHEN $2 = false THEN body ELSE '' END) as body,
+SELECT id, name, type, subject, (CASE WHEN $2 = false THEN body ELSE '' END) as body,
     is_default, created_at, updated_at
-    FROM templates WHERE $1 = 0 OR id = $1
+    FROM templates WHERE ($1 = 0 OR id = $1) AND ($3 = '' OR type = $3::template_type)
     ORDER BY created_at;
 
 -- name: create-template
-INSERT INTO templates (name, body) VALUES($1, $2) RETURNING id;
+INSERT INTO templates (name, type, subject, body) VALUES($1, $2, $3, $4) RETURNING id;
 
 -- name: update-template
 UPDATE templates SET
     name=(CASE WHEN $2 != '' THEN $2 ELSE name END),
-    body=(CASE WHEN $3 != '' THEN $3 ELSE body END),
+    subject=(CASE WHEN $3 != '' THEN $3 ELSE name END),
+    body=(CASE WHEN $4 != '' THEN $4 ELSE body END),
     updated_at=NOW()
 WHERE id = $1;
 
 -- name: set-default-template
 WITH u AS (
-    UPDATE templates SET is_default=true WHERE id=$1 RETURNING id
+    UPDATE templates SET is_default=true WHERE id=$1 AND type='campaign' RETURNING id
 )
 UPDATE templates SET is_default=false WHERE id != $1;
 
@@ -774,10 +781,12 @@ WITH tpl AS (
     DELETE FROM templates WHERE id = $1 AND (SELECT COUNT(id) FROM templates) > 1 AND is_default = false RETURNING id
 ),
 def AS (
-    SELECT id FROM templates WHERE is_default = true LIMIT 1
+    SELECT id FROM templates WHERE is_default = true AND type='campaign' LIMIT 1
+),
+up AS (
+    UPDATE campaigns SET template_id = (SELECT id FROM def) WHERE (SELECT id FROM tpl) > 0 AND template_id = $1
 )
-UPDATE campaigns SET template_id = (SELECT id FROM def) WHERE (SELECT id FROM tpl) > 0 AND template_id = $1
-    RETURNING (SELECT id FROM tpl);
+SELECT id FROM tpl;
 
 
 -- media
