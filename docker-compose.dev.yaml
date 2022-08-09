@@ -23,7 +23,8 @@ services:
     restart: unless-stopped
 
   listmonk-web:
-    image: listmonk/listmonk:latest
+    # image: listmonk/listmonk:latest
+    build: .
     labels:
       shipyard.route: '/'
     container_name: listmonk-web
