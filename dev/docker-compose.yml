@@ -28,6 +28,8 @@ services:
       context: ../
       dockerfile: dev/app.Dockerfile
     command: ["make", "run-frontend"]
+    labels:
+      shipyard.route: '/'
     ports:
       - "8080:8080"
     environment:
