@@ -3,6 +3,8 @@ package s3
 import (
 	"fmt"
 	"io"
+	"net/url"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -37,6 +39,11 @@ func NewS3Store(opt Opt) (media.Store, error) {
 		opt.URL = fmt.Sprintf("https://s3.%s.amazonaws.com", opt.Region)
 	}
 	opt.URL = strings.TrimRight(opt.URL, "/")
+
+	// Default (and max S3 expiry) is 7 days.
+	if opt.Expiry.Seconds() < 1 {
+		opt.Expiry = time.Duration(167) * time.Hour
+	}
 
 	if opt.AccessKey == "" && opt.SecretKey == "" {
 		// fallback to IAM role if no access key/secret key is provided.
@@ -80,9 +87,10 @@ func (c *Client) Put(name string, cType string, file io.ReadSeeker) (string, err
 }
 
 // Get accepts the filename of the object stored and retrieves from S3.
-func (c *Client) Get(name string) string {
-	// Generate a private S3 pre-signed URL if it's a private bucket.
-	if c.opts.BucketType == "private" {
+func (c *Client) GetURL(name string) string {
+	// Generate a private S3 pre-signed URL if it's a private bucket, and there
+	// is no public URL provided.
+	if c.opts.BucketType == "private" && c.opts.PublicURL == "" {
 		u := c.s3.GeneratePresignedURL(simples3.PresignedInput{
 			Bucket:        c.opts.Bucket,
 			ObjectKey:     c.makeBucketPath(name),
@@ -93,8 +101,34 @@ func (c *Client) Get(name string) string {
 		return u
 	}
 
-	// Generate a public S3 URL if it's a public bucket.
+	// Generate a public S3 URL if it's a public bucket or a public URL is
+	// provided.
 	return c.makeFileURL(name)
+}
+
+// GetBlob reads a file from S3 and returns the raw bytes.
+func (c *Client) GetBlob(uurl string) ([]byte, error) {
+	if p, err := url.Parse(uurl); err != nil {
+		uurl = filepath.Base(uurl)
+	} else {
+		uurl = filepath.Base(p.Path)
+	}
+
+	file, err := c.s3.FileDownload(simples3.DownloadInput{
+		Bucket:    c.opts.Bucket,
+		ObjectKey: c.makeBucketPath(filepath.Base(uurl)),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	b, err := io.ReadAll(file)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	return b, nil
 }
 
 // Delete accepts the filename of the object and deletes from S3.

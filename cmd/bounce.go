@@ -2,7 +2,7 @@ package main
 
 import (
 	"encoding/json"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -15,7 +15,7 @@ import (
 func handleGetBounces(c echo.Context) error {
 	var (
 		app = c.Get("app").(*App)
-		pg  = getPagination(c.QueryParams(), 50)
+		pg  = app.paginator.NewFromURL(c.Request().URL.Query())
 
 		id, _     = strconv.Atoi(c.Param("id"))
 		campID, _ = strconv.Atoi(c.QueryParam("campaign_id"))
@@ -121,7 +121,7 @@ func handleBounceWebhook(c echo.Context) error {
 	)
 
 	// Read the request body instead of using c.Bind() to read to save the entire raw request as meta.
-	rawReq, err := ioutil.ReadAll(c.Request().Body)
+	rawReq, err := io.ReadAll(c.Request().Body)
 	if err != nil {
 		app.log.Printf("error reading ses notification body: %v", err)
 		return echo.NewHTTPError(http.StatusBadRequest, app.i18n.Ts("globals.messages.internalError"))
@@ -132,7 +132,7 @@ func handleBounceWebhook(c echo.Context) error {
 	case service == "":
 		var b models.Bounce
 		if err := json.Unmarshal(rawReq, &b); err != nil {
-			return echo.NewHTTPError(http.StatusBadRequest, app.i18n.Ts("globals.messages.invalidData"))
+			return echo.NewHTTPError(http.StatusBadRequest, app.i18n.Ts("globals.messages.invalidData")+":"+err.Error())
 		}
 
 		if bv, err := validateBounceFields(b, app); err != nil {
@@ -191,6 +191,19 @@ func handleBounceWebhook(c echo.Context) error {
 		}
 		bounces = append(bounces, bs...)
 
+	// Postmark.
+	case service == "postmark" && app.constants.BouncePostmarkEnabled:
+		bs, err := app.bounce.Postmark.ProcessBounce(rawReq, c)
+		if err != nil {
+			app.log.Printf("error processing postmark notification: %v", err)
+			if _, ok := err.(*echo.HTTPError); ok {
+				return err
+			}
+
+			return echo.NewHTTPError(http.StatusBadRequest, app.i18n.T("globals.messages.invalidData"))
+		}
+		bounces = append(bounces, bs...)
+
 	default:
 		return echo.NewHTTPError(http.StatusBadRequest, app.i18n.Ts("bounces.unknownService"))
 	}
@@ -207,11 +220,11 @@ func handleBounceWebhook(c echo.Context) error {
 
 func validateBounceFields(b models.Bounce, app *App) (models.Bounce, error) {
 	if b.Email == "" && b.SubscriberUUID == "" {
-		return b, echo.NewHTTPError(http.StatusBadRequest, app.i18n.T("globals.messages.invalidData"))
+		return b, echo.NewHTTPError(http.StatusBadRequest, app.i18n.Ts("globals.messages.invalidFields", "name", "email / subscriber_uuid"))
 	}
 
 	if b.SubscriberUUID != "" && !reUUID.MatchString(b.SubscriberUUID) {
-		return b, echo.NewHTTPError(http.StatusBadRequest, app.i18n.T("globals.messages.invalidUUID"))
+		return b, echo.NewHTTPError(http.StatusBadRequest, app.i18n.Ts("globals.messages.invalidFields", "name", "subscriber_uuid"))
 	}
 
 	if b.Email != "" {
@@ -222,8 +235,8 @@ func validateBounceFields(b models.Bounce, app *App) (models.Bounce, error) {
 		b.Email = em
 	}
 
-	if b.Type != models.BounceTypeHard && b.Type != models.BounceTypeSoft {
-		return b, echo.NewHTTPError(http.StatusBadRequest, app.i18n.T("globals.messages.invalidData"))
+	if b.Type != models.BounceTypeHard && b.Type != models.BounceTypeSoft && b.Type != models.BounceTypeComplaint {
+		return b, echo.NewHTTPError(http.StatusBadRequest, app.i18n.Ts("globals.messages.invalidFields", "name", "type"))
 	}
 
 	return b, nil

@@ -1,20 +1,20 @@
 package main
 
 import (
+	"bytes"
 	"crypto/subtle"
 	"net/http"
-	"net/url"
 	"path"
 	"regexp"
-	"strconv"
 
+	"github.com/knadh/paginator"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 )
 
 const (
 	// stdInputMaxLen is the maximum allowed length for a standard input field.
-	stdInputMaxLen = 200
+	stdInputMaxLen = 2000
 
 	sortAsc  = "asc"
 	sortDesc = "desc"
@@ -35,6 +35,14 @@ type pagination struct {
 var (
 	reUUID     = regexp.MustCompile("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 	reLangCode = regexp.MustCompile("[^a-zA-Z_0-9\\-]")
+
+	paginate = paginator.New(paginator.Opt{
+		DefaultPerPage: 20,
+		MaxPerPage:     50,
+		NumPageNums:    10,
+		PageParam:      "page",
+		PerPageParam:   "per_page",
+	})
 )
 
 // registerHandlers registers HTTP handlers.
@@ -49,11 +57,20 @@ func initHTTPHandlers(e *echo.Echo, app *App) {
 		g = e.Group("", middleware.BasicAuth(basicAuth))
 	}
 
+	e.HTTPErrorHandler = func(err error, c echo.Context) {
+		// Generic, non-echo error. Log it.
+		if _, ok := err.(*echo.HTTPError); !ok {
+			app.log.Println(err.Error())
+		}
+		e.DefaultHTTPErrorHandler(err, c)
+	}
+
 	// Admin JS app views.
 	// /admin/static/* file server is registered in initHTTPServer().
 	e.GET("/", func(c echo.Context) error {
 		return c.Render(http.StatusOK, "home", publicTpl{Title: "listmonk"})
 	})
+
 	g.GET(path.Join(adminRoot, ""), handleAdminPage)
 	g.GET(path.Join(adminRoot, "/custom.css"), serveCustomApperance("admin.custom_css"))
 	g.GET(path.Join(adminRoot, "/custom.js"), serveCustomApperance("admin.custom_js"))
@@ -71,6 +88,7 @@ func initHTTPHandlers(e *echo.Echo, app *App) {
 	g.POST("/api/settings/smtp/test", handleTestSMTPSettings)
 	g.POST("/api/admin/reload", handleReloadApp)
 	g.GET("/api/logs", handleGetLogs)
+	g.GET("/api/about", handleGetAboutInfo)
 
 	g.GET("/api/subscribers/:id", handleGetSubscriber)
 	g.GET("/api/subscribers/:id/export", handleExportSubscriberData)
@@ -123,6 +141,7 @@ func initHTTPHandlers(e *echo.Echo, app *App) {
 	g.POST("/api/campaigns", handleCreateCampaign)
 	g.PUT("/api/campaigns/:id", handleUpdateCampaign)
 	g.PUT("/api/campaigns/:id/status", handleUpdateCampaignStatus)
+	g.PUT("/api/campaigns/:id/archive", handleUpdateCampaignArchive)
 	g.DELETE("/api/campaigns/:id", handleDeleteCampaign)
 
 	g.GET("/api/media", handleGetMedia)
@@ -139,7 +158,13 @@ func initHTTPHandlers(e *echo.Echo, app *App) {
 	g.PUT("/api/templates/:id/default", handleTemplateSetDefault)
 	g.DELETE("/api/templates/:id", handleDeleteTemplate)
 
+	g.DELETE("/api/maintenance/subscribers/:type", handleGCSubscribers)
+	g.DELETE("/api/maintenance/analytics/:type", handleGCCampaignAnalytics)
+	g.DELETE("/api/maintenance/subscriptions/unconfirmed", handleGCSubscriptions)
+
 	g.POST("/api/tx", handleSendTxMessage)
+
+	g.GET("/api/events", handleEventStream)
 
 	if app.constants.BounceWebhooksEnabled {
 		// Private authenticated bounce endpoint.
@@ -149,13 +174,21 @@ func initHTTPHandlers(e *echo.Echo, app *App) {
 		e.POST("/webhooks/service/:service", handleBounceWebhook)
 	}
 
+	// Public API endpoints.
+	e.GET("/api/public/lists", handleGetPublicLists)
+	e.POST("/api/public/subscription", handlePublicSubscription)
+
+	if app.constants.EnablePublicArchive {
+		e.GET("/api/public/archive", handleGetCampaignArchives)
+	}
+
 	// /public/static/* file server is registered in initHTTPServer().
 	// Public subscriber facing views.
 	e.GET("/subscription/form", handleSubscriptionFormPage)
 	e.POST("/subscription/form", handleSubscriptionForm)
 	e.GET("/subscription/:campUUID/:subUUID", noIndex(validateUUID(subscriberExists(handleSubscriptionPage),
 		"campUUID", "subUUID")))
-	e.POST("/subscription/:campUUID/:subUUID", validateUUID(subscriberExists(handleSubscriptionPage),
+	e.POST("/subscription/:campUUID/:subUUID", validateUUID(subscriberExists(handleSubscriptionPrefs),
 		"campUUID", "subUUID"))
 	e.GET("/subscription/optin/:subUUID", noIndex(validateUUID(subscriberExists(handleOptinPage), "subUUID")))
 	e.POST("/subscription/optin/:subUUID", validateUUID(subscriberExists(handleOptinPage), "subUUID"))
@@ -170,11 +203,30 @@ func initHTTPHandlers(e *echo.Echo, app *App) {
 	e.GET("/campaign/:campUUID/:subUUID/px.png", noIndex(validateUUID(handleRegisterCampaignView,
 		"campUUID", "subUUID")))
 
+	if app.constants.EnablePublicArchive {
+		e.GET("/archive", handleCampaignArchivesPage)
+		e.GET("/archive.xml", handleGetCampaignArchivesFeed)
+		e.GET("/archive/:id", handleCampaignArchivePage)
+		e.GET("/archive/latest", handleCampaignArchivePageLatest)
+	}
+
 	e.GET("/public/custom.css", serveCustomApperance("public.custom_css"))
 	e.GET("/public/custom.js", serveCustomApperance("public.custom_js"))
 
 	// Public health API endpoint.
 	e.GET("/health", handleHealthCheck)
+
+	// 404 pages.
+	e.RouteNotFound("/*", func(c echo.Context) error {
+		return c.Render(http.StatusNotFound, tplMessage,
+			makeMsgTpl("404 - "+app.i18n.T("public.notFoundTitle"), "", ""))
+	})
+	e.RouteNotFound("/api/*", func(c echo.Context) error {
+		return echo.NewHTTPError(http.StatusNotFound, "404 unknown endpoint")
+	})
+	e.RouteNotFound("/admin/*", func(c echo.Context) error {
+		return echo.NewHTTPError(http.StatusNotFound, "404 page not found")
+	})
 }
 
 // handleAdminPage is the root handler that renders the Javascript admin frontend.
@@ -185,6 +237,8 @@ func handleAdminPage(c echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
+
+	b = bytes.ReplaceAll(b, []byte("asset_version"), []byte(app.constants.AssetVersion))
 
 	return c.HTMLBlob(http.StatusOK, b)
 }
@@ -289,36 +343,5 @@ func noIndex(next echo.HandlerFunc, params ...string) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		c.Response().Header().Set("X-Robots-Tag", "noindex")
 		return next(c)
-	}
-}
-
-// getPagination takes form values and extracts pagination values from it.
-func getPagination(q url.Values, perPage int) pagination {
-	var (
-		page, _ = strconv.Atoi(q.Get("page"))
-		pp      = q.Get("per_page")
-	)
-
-	if pp == "all" {
-		// No limit.
-		perPage = 0
-	} else {
-		ppi, _ := strconv.Atoi(pp)
-		if ppi > 0 {
-			perPage = ppi
-		}
-	}
-
-	if page < 1 {
-		page = 0
-	} else {
-		page--
-	}
-
-	return pagination{
-		Page:    page + 1,
-		PerPage: perPage,
-		Offset:  page * perPage,
-		Limit:   perPage,
 	}
 }

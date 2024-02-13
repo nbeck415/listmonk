@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
@@ -15,6 +16,7 @@ import (
 	"github.com/knadh/listmonk/models"
 	"github.com/labstack/echo/v4"
 	"github.com/lib/pq"
+	"gopkg.in/volatiletech/null.v6"
 )
 
 // campaignReq is a wrapper over the Campaign model for receiving
@@ -31,6 +33,8 @@ type campaignReq struct {
 	// to the outside world.
 	ListIDs []int `json:"lists"`
 
+	MediaIDs []int `json:"media"`
+
 	// This is only relevant to campaign test requests.
 	SubscriberEmails pq.StringArray `json:"subscribers"`
 }
@@ -44,23 +48,25 @@ type campaignContentReq struct {
 }
 
 var (
-	regexFromAddress = regexp.MustCompile(`(.+?)\s<(.+?)@(.+?)>`)
+	regexFromAddress = regexp.MustCompile(`((.+?)\s)?<(.+?)@(.+?)>`)
+	regexSlug        = regexp.MustCompile(`[^\p{L}\p{M}\p{N}]`)
 )
 
 // handleGetCampaigns handles retrieval of campaigns.
 func handleGetCampaigns(c echo.Context) error {
 	var (
 		app = c.Get("app").(*App)
-		pg  = getPagination(c.QueryParams(), 20)
+		pg  = app.paginator.NewFromURL(c.Request().URL.Query())
 
 		status    = c.QueryParams()["status"]
+		tags      = c.QueryParams()["tag"]
 		query     = strings.TrimSpace(c.FormValue("query"))
 		orderBy   = c.FormValue("order_by")
 		order     = c.FormValue("order")
 		noBody, _ = strconv.ParseBool(c.QueryParam("no_body"))
 	)
 
-	res, total, err := app.core.QueryCampaigns(query, status, orderBy, order, pg.Offset, pg.Limit)
+	res, total, err := app.core.QueryCampaigns(query, status, tags, orderBy, order, pg.Offset, pg.Limit)
 	if err != nil {
 		return err
 	}
@@ -95,7 +101,7 @@ func handleGetCampaign(c echo.Context) error {
 		noBody, _ = strconv.ParseBool(c.QueryParam("no_body"))
 	)
 
-	out, err := app.core.GetCampaign(id, "")
+	out, err := app.core.GetCampaign(id, "", "")
 	if err != nil {
 		return err
 	}
@@ -215,7 +221,11 @@ func handleCreateCampaign(c echo.Context) error {
 		o = c
 	}
 
-	out, err := app.core.CreateCampaign(o.Campaign, o.ListIDs)
+	if o.ArchiveTemplateID == 0 {
+		o.ArchiveTemplateID = o.TemplateID
+	}
+
+	out, err := app.core.CreateCampaign(o.Campaign, o.ListIDs, o.MediaIDs)
 	if err != nil {
 		return err
 	}
@@ -236,7 +246,7 @@ func handleUpdateCampaign(c echo.Context) error {
 
 	}
 
-	cm, err := app.core.GetCampaign(id, "")
+	cm, err := app.core.GetCampaign(id, "", "")
 	if err != nil {
 		return err
 	}
@@ -259,7 +269,7 @@ func handleUpdateCampaign(c echo.Context) error {
 		o = c
 	}
 
-	out, err := app.core.UpdateCampaign(id, o.Campaign, o.ListIDs, o.SendLater)
+	out, err := app.core.UpdateCampaign(id, o.Campaign, o.ListIDs, o.MediaIDs, o.SendLater)
 	if err != nil {
 		return err
 	}
@@ -291,7 +301,45 @@ func handleUpdateCampaignStatus(c echo.Context) error {
 		return err
 	}
 
+	if o.Status == models.CampaignStatusPaused || o.Status == models.CampaignStatusCancelled {
+		app.manager.StopCampaign(id)
+	}
+
 	return c.JSON(http.StatusOK, okResp{out})
+}
+
+// handleUpdateCampaignArchive handles campaign status modification.
+func handleUpdateCampaignArchive(c echo.Context) error {
+	var (
+		app   = c.Get("app").(*App)
+		id, _ = strconv.Atoi(c.Param("id"))
+	)
+
+	req := struct {
+		Archive     bool        `json:"archive"`
+		TemplateID  int         `json:"archive_template_id"`
+		Meta        models.JSON `json:"archive_meta"`
+		ArchiveSlug string      `json:"archive_slug"`
+	}{}
+
+	// Get and validate fields.
+	if err := c.Bind(&req); err != nil {
+		return err
+	}
+
+	if req.ArchiveSlug != "" {
+		// Format the slug to be alpha-numeric-dash.
+		s := strings.ToLower(req.ArchiveSlug)
+		s = strings.TrimSpace(regexSlug.ReplaceAllString(s, " "))
+		s = regexpSpaces.ReplaceAllString(s, "-")
+		req.ArchiveSlug = s
+	}
+
+	if err := app.core.UpdateCampaignArchive(id, req.Archive, req.TemplateID, req.Meta, req.ArchiveSlug); err != nil {
+		return err
+	}
+
+	return c.JSON(http.StatusOK, okResp{req})
 }
 
 // handleDeleteCampaign handles campaign deletion.
@@ -407,11 +455,17 @@ func handleTestCampaign(c echo.Context) error {
 	camp.ContentType = req.ContentType
 	camp.Headers = req.Headers
 	camp.TemplateID = req.TemplateID
+	for _, id := range req.MediaIDs {
+		if id > 0 {
+			camp.MediaIDs = append(camp.MediaIDs, int64(id))
+		}
+	}
 
 	// Send the test messages.
 	for _, s := range subs {
 		sub := s
-		if err := sendTestMessage(sub, &camp, app); err != nil {
+		c := camp
+		if err := sendTestMessage(sub, &c, app); err != nil {
 			app.log.Printf("error sending test message: %v", err)
 			return echo.NewHTTPError(http.StatusInternalServerError,
 				app.i18n.Ts("campaigns.errorSendTest", "error", err.Error()))
@@ -501,10 +555,6 @@ func validateCampaignFields(c campaignReq, app *App) (campaignReq, error) {
 		return c, errors.New(app.i18n.T("campaigns.fieldInvalidSubject"))
 	}
 
-	// if !hasLen(c.Body, 1, bodyMaxLen) {
-	// 	return c,errors.New("invalid length for `body`")
-	// }
-
 	// If there's a "send_at" date, it should be in the future.
 	if c.SendAt.Valid {
 		if c.SendAt.Time.Before(time.Now()) {
@@ -527,6 +577,22 @@ func validateCampaignFields(c campaignReq, app *App) (campaignReq, error) {
 
 	if len(c.Headers) == 0 {
 		c.Headers = make([]map[string]string, 0)
+	}
+
+	if len(c.ArchiveMeta) == 0 {
+		c.ArchiveMeta = json.RawMessage("{}")
+	}
+
+	if c.ArchiveSlug.String != "" {
+		// Format the slug to be alpha-numeric-dash.
+		s := strings.ToLower(c.ArchiveSlug.String)
+		s = strings.TrimSpace(regexSlug.ReplaceAllString(s, " "))
+		s = regexpSpaces.ReplaceAllString(s, "-")
+
+		c.ArchiveSlug = null.NewString(s, true)
+	} else {
+		// If there's no slug set, set it to NULL in the DB.
+		c.ArchiveSlug.Valid = false
 	}
 
 	return c, nil

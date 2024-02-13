@@ -3,12 +3,11 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"regexp"
 	"strings"
 
-	"github.com/gofrs/uuid"
+	"github.com/gofrs/uuid/v5"
 	"github.com/jmoiron/sqlx"
 	"github.com/knadh/listmonk/models"
 	"github.com/knadh/stuffbin"
@@ -74,6 +73,7 @@ func install(lastVer string, db *sqlx.DB, fs stuffbin.FileSystem, prompt, idempo
 		models.ListTypePrivate,
 		models.ListOptinSingle,
 		pq.StringArray{"test"},
+		"",
 	); err != nil {
 		lo.Fatalf("error creating list: %v", err)
 	}
@@ -83,6 +83,7 @@ func install(lastVer string, db *sqlx.DB, fs stuffbin.FileSystem, prompt, idempo
 		models.ListTypePublic,
 		models.ListOptinDouble,
 		pq.StringArray{"test"},
+		"",
 	); err != nil {
 		lo.Fatalf("error creating list: %v", err)
 	}
@@ -123,6 +124,17 @@ func install(lastVer string, db *sqlx.DB, fs stuffbin.FileSystem, prompt, idempo
 		lo.Fatalf("error setting default template: %v", err)
 	}
 
+	// Default campaign archive template.
+	archiveTpl, err := fs.Get("/static/email-templates/default-archive.tpl")
+	if err != nil {
+		lo.Fatalf("error reading default archive template: %v", err)
+	}
+
+	var archiveTplID int
+	if err := q.CreateTemplate.Get(&archiveTplID, "Default archive template", models.TemplateTypeCampaign, "", archiveTpl.ReadBytes()); err != nil {
+		lo.Fatalf("error creating default campaign template: %v", err)
+	}
+
 	// Sample campaign.
 	if _, err := q.CreateCampaign.Exec(uuid.Must(uuid.NewV4()),
 		models.CampaignTypeRegular,
@@ -145,6 +157,11 @@ func install(lastVer string, db *sqlx.DB, fs stuffbin.FileSystem, prompt, idempo
 		emailMsgr,
 		campTplID,
 		pq.Int64Array{1},
+		false,
+		"welcome-to-listmonk",
+		archiveTplID,
+		`{"name": "Subscriber"}`,
+		nil,
 	); err != nil {
 		lo.Fatalf("error creating sample campaign: %v", err)
 	}
@@ -207,7 +224,7 @@ func newConfigFile(path string) error {
 			ReplaceAll(b, []byte(fmt.Sprintf(`admin_password = "%s"`, pwd)))
 	}
 
-	return ioutil.WriteFile(path, b, 0644)
+	return os.WriteFile(path, b, 0644)
 }
 
 // checkSchema checks if the DB schema is installed.

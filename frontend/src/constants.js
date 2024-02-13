@@ -10,22 +10,23 @@ export const models = Object.freeze({
   bounces: 'bounces',
   settings: 'settings',
   logs: 'logs',
+  maintenance: 'maintenance',
 });
 
 // Ad-hoc URIs that are used outside of vuex requests.
-const rootURL = process.env.VUE_APP_ROOT_URL || '/';
-const baseURL = process.env.BASE_URL.replace(/\/$/, '');
+const rootURL = import.meta.env.VUE_APP_ROOT_URL || '/';
+const baseURL = import.meta.env.BASE_URL.replace(/\/$/, '');
 
 export const uris = Object.freeze({
   previewCampaign: '/api/campaigns/:id/preview',
   previewTemplate: '/api/templates/:id/preview',
   previewRawTemplate: '/api/templates/preview',
   exportSubscribers: '/api/subscribers/export',
+  errorEvents: '/api/events?type=error',
   base: `${baseURL}/static`,
   root: rootURL,
   static: `${baseURL}/static`,
 });
-
 
 // Keys used in Vuex store.
 export const storeKeys = Object.freeze({

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"fmt"
 	"path/filepath"
@@ -98,4 +99,17 @@ func strSliceContains(str string, sl []string) bool {
 	}
 
 	return false
+}
+
+func trimNullBytes(b []byte) string {
+	return string(bytes.Trim(b, "\x00"))
+}
+
+func titleCase(input string) string {
+	parts := strings.Fields(input)
+	for n, p := range parts {
+		parts[n] = strings.Title(p)
+	}
+
+	return strings.Join(parts, " ")
 }

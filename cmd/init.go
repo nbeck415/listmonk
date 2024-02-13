@@ -2,34 +2,39 @@ package main
 
 import (
 	"bytes"
+	"crypto/md5"
 	"encoding/json"
 	"fmt"
 	"html/template"
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/Masterminds/sprig/v3"
+	"github.com/gdgvda/cron"
 	"github.com/jmoiron/sqlx"
 	"github.com/jmoiron/sqlx/types"
 	"github.com/knadh/goyesql/v2"
 	goyesqlx "github.com/knadh/goyesql/v2/sqlx"
-	"github.com/knadh/koanf"
 	"github.com/knadh/koanf/maps"
 	"github.com/knadh/koanf/parsers/toml"
 	"github.com/knadh/koanf/providers/confmap"
 	"github.com/knadh/koanf/providers/file"
 	"github.com/knadh/koanf/providers/posflag"
+	"github.com/knadh/koanf/v2"
 	"github.com/knadh/listmonk/internal/bounce"
 	"github.com/knadh/listmonk/internal/bounce/mailbox"
+	"github.com/knadh/listmonk/internal/captcha"
+	"github.com/knadh/listmonk/internal/core"
 	"github.com/knadh/listmonk/internal/i18n"
 	"github.com/knadh/listmonk/internal/manager"
 	"github.com/knadh/listmonk/internal/media"
 	"github.com/knadh/listmonk/internal/media/providers/filesystem"
 	"github.com/knadh/listmonk/internal/media/providers/s3"
-	"github.com/knadh/listmonk/internal/messenger"
 	"github.com/knadh/listmonk/internal/messenger/email"
 	"github.com/knadh/listmonk/internal/messenger/postback"
 	"github.com/knadh/listmonk/internal/subimporter"
@@ -49,23 +54,33 @@ const (
 
 // constants contains static, constant config values required by the app.
 type constants struct {
-	RootURL               string   `koanf:"root_url"`
-	LogoURL               string   `koanf:"logo_url"`
-	FaviconURL            string   `koanf:"favicon_url"`
-	FromEmail             string   `koanf:"from_email"`
-	NotifyEmails          []string `koanf:"notify_emails"`
-	EnablePublicSubPage   bool     `koanf:"enable_public_subscription_page"`
-	SendOptinConfirmation bool     `koanf:"send_optin_confirmation"`
-	Lang                  string   `koanf:"lang"`
-	DBBatchSize           int      `koanf:"batch_size"`
-	Privacy               struct {
+	SiteName                      string   `koanf:"site_name"`
+	RootURL                       string   `koanf:"root_url"`
+	LogoURL                       string   `koanf:"logo_url"`
+	FaviconURL                    string   `koanf:"favicon_url"`
+	FromEmail                     string   `koanf:"from_email"`
+	NotifyEmails                  []string `koanf:"notify_emails"`
+	EnablePublicSubPage           bool     `koanf:"enable_public_subscription_page"`
+	EnablePublicArchive           bool     `koanf:"enable_public_archive"`
+	EnablePublicArchiveRSSContent bool     `koanf:"enable_public_archive_rss_content"`
+	SendOptinConfirmation         bool     `koanf:"send_optin_confirmation"`
+	Lang                          string   `koanf:"lang"`
+	DBBatchSize                   int      `koanf:"batch_size"`
+	Privacy                       struct {
 		IndividualTracking bool            `koanf:"individual_tracking"`
+		AllowPreferences   bool            `koanf:"allow_preferences"`
 		AllowBlocklist     bool            `koanf:"allow_blocklist"`
 		AllowExport        bool            `koanf:"allow_export"`
 		AllowWipe          bool            `koanf:"allow_wipe"`
+		RecordOptinIP      bool            `koanf:"record_optin_ip"`
 		Exportable         map[string]bool `koanf:"-"`
-		DomainBlocklist    map[string]bool `koanf:"-"`
+		DomainBlocklist    []string        `koanf:"-"`
 	} `koanf:"privacy"`
+	Security struct {
+		EnableCaptcha bool   `koanf:"enable_captcha"`
+		CaptchaKey    string `koanf:"captcha_key"`
+		CaptchaSecret string `koanf:"captcha_secret"`
+	} `koanf:"security"`
 	AdminUsername []byte `koanf:"admin_username"`
 	AdminPassword []byte `koanf:"admin_password"`
 
@@ -76,16 +91,23 @@ type constants struct {
 		PublicJS  []byte `koanf:"public.custom_js"`
 	}
 
-	UnsubURL      string
-	LinkTrackURL  string
-	ViewTrackURL  string
-	OptinURL      string
-	MessageURL    string
-	MediaProvider string
+	UnsubURL     string
+	LinkTrackURL string
+	ViewTrackURL string
+	OptinURL     string
+	MessageURL   string
+	ArchiveURL   string
+	AssetVersion string
+
+	MediaUpload struct {
+		Provider   string
+		Extensions []string
+	}
 
 	BounceWebhooksEnabled bool
 	BounceSESEnabled      bool
 	BounceSendgridEnabled bool
+	BouncePostmarkEnabled bool
 }
 
 type notifTpls struct {
@@ -167,15 +189,15 @@ func initFS(appDir, frontendDir, staticDir, i18nDir string) stuffbin.FileSystem 
 		}
 	)
 
-	// Get the executable's path.
-	path, err := os.Executable()
+	// Get the executable's execPath.
+	execPath, err := os.Executable()
 	if err != nil {
 		lo.Fatalf("error getting executable path: %v", err)
 	}
 
 	// Load embedded files in the executable.
 	hasEmbed := true
-	fs, err := stuffbin.UnStuff(path)
+	fs, err := stuffbin.UnStuff(execPath)
 	if err != nil {
 		hasEmbed = false
 
@@ -211,7 +233,18 @@ func initFS(appDir, frontendDir, staticDir, i18nDir string) stuffbin.FileSystem 
 		if staticDir == "" {
 			// Default dir in cwd.
 			staticDir = "static"
+		} else {
+			// There is a custom static directory. Any paths that aren't in it, exclude.
+			sf := []string{}
+			for _, def := range staticFiles {
+				s := strings.Split(def, ":")[0]
+				if _, err := os.Stat(path.Join(staticDir, s)); err == nil {
+					sf = append(sf, def)
+				}
+			}
+			staticFiles = sf
 		}
+
 		lo.Printf("loading static files from: %v", staticDir)
 		files = append(files, joinFSPaths(staticDir, staticFiles)...)
 	}
@@ -244,6 +277,7 @@ func initDB() *sqlx.DB {
 		Password    string        `koanf:"password"`
 		DBName      string        `koanf:"database"`
 		SSLMode     string        `koanf:"ssl_mode"`
+		Params      string        `koanf:"params"`
 		MaxOpen     int           `koanf:"max_open"`
 		MaxIdle     int           `koanf:"max_idle"`
 		MaxLifetime time.Duration `koanf:"max_lifetime"`
@@ -254,7 +288,7 @@ func initDB() *sqlx.DB {
 
 	lo.Printf("connecting to db: %s:%d/%s", c.Host, c.Port, c.DBName)
 	db, err := sqlx.Connect("postgres",
-		fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s", c.Host, c.Port, c.User, c.Password, c.DBName, c.SSLMode))
+		fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s %s", c.Host, c.Port, c.User, c.Password, c.DBName, c.SSLMode, c.Params))
 	if err != nil {
 		lo.Fatalf("error connecting to DB: %v", err)
 	}
@@ -346,6 +380,9 @@ func initConstants() *constants {
 	if err := ko.Unmarshal("privacy", &c.Privacy); err != nil {
 		lo.Fatalf("error loading app.privacy config: %v", err)
 	}
+	if err := ko.Unmarshal("security", &c.Security); err != nil {
+		lo.Fatalf("error loading app.security config: %v", err)
+	}
 	if err := ko.UnmarshalWithConf("appearance", &c.Appearance, koanf.UnmarshalConf{FlatPaths: true}); err != nil {
 		lo.Fatalf("error loading app.appearance config: %v", err)
 	}
@@ -353,8 +390,9 @@ func initConstants() *constants {
 	c.RootURL = strings.TrimRight(c.RootURL, "/")
 	c.Lang = ko.String("app.lang")
 	c.Privacy.Exportable = maps.StringSliceToLookupMap(ko.Strings("privacy.exportable"))
-	c.MediaProvider = ko.String("upload.provider")
-	c.Privacy.DomainBlocklist = maps.StringSliceToLookupMap(ko.Strings("privacy.domain_blocklist"))
+	c.MediaUpload.Provider = ko.String("upload.provider")
+	c.MediaUpload.Extensions = ko.Strings("upload.extensions")
+	c.Privacy.DomainBlocklist = ko.Strings("privacy.domain_blocklist")
 
 	// Static URLS.
 	// url.com/subscription/{campaign_uuid}/{subscriber_uuid}
@@ -369,12 +407,20 @@ func initConstants() *constants {
 	// url.com/link/{campaign_uuid}/{subscriber_uuid}
 	c.MessageURL = fmt.Sprintf("%s/campaign/%%s/%%s", c.RootURL)
 
+	// url.com/archive
+	c.ArchiveURL = c.RootURL + "/archive"
+
 	// url.com/campaign/{campaign_uuid}/{subscriber_uuid}/px.png
 	c.ViewTrackURL = fmt.Sprintf("%s/campaign/%%s/%%s/px.png", c.RootURL)
 
 	c.BounceWebhooksEnabled = ko.Bool("bounce.webhooks_enabled")
 	c.BounceSESEnabled = ko.Bool("bounce.ses_enabled")
 	c.BounceSendgridEnabled = ko.Bool("bounce.sendgrid_enabled")
+	c.BouncePostmarkEnabled = ko.Bool("bounce.postmark.enabled")
+
+	b := md5.Sum([]byte(time.Now().String()))
+	c.AssetVersion = fmt.Sprintf("%x", b)[0:10]
+
 	return &c
 }
 
@@ -423,13 +469,14 @@ func initCampaignManager(q *models.Queries, cs *constants, app *App) *manager.Ma
 		LinkTrackURL:          cs.LinkTrackURL,
 		ViewTrackURL:          cs.ViewTrackURL,
 		MessageURL:            cs.MessageURL,
+		ArchiveURL:            cs.ArchiveURL,
 		UnsubHeader:           ko.Bool("privacy.unsubscribe_header"),
 		SlidingWindow:         ko.Bool("app.message_sliding_window"),
 		SlidingWindowDuration: ko.Duration("app.message_sliding_window_duration"),
 		SlidingWindowRate:     ko.Int("app.message_sliding_window_rate"),
 		ScanInterval:          time.Second * 5,
 		ScanCampaigns:         !ko.Bool("passive"),
-	}, newManagerStore(q), campNotifCB, app.i18n, lo)
+	}, newManagerStore(q, app.core, app.media), campNotifCB, app.i18n, lo)
 }
 
 func initTxTemplates(m *manager.Manager, app *App) {
@@ -439,16 +486,17 @@ func initTxTemplates(m *manager.Manager, app *App) {
 	}
 
 	for _, t := range tpls {
-		if err := t.Compile(app.manager.GenericTemplateFuncs()); err != nil {
-			lo.Printf("error compiling transactional template %d: %v", t.ID, err)
+		tpl := t
+		if err := tpl.Compile(app.manager.GenericTemplateFuncs()); err != nil {
+			lo.Printf("error compiling transactional template %d: %v", tpl.ID, err)
 			continue
 		}
-		m.CacheTpl(t.ID, &t)
+		m.CacheTpl(tpl.ID, &tpl)
 	}
 }
 
 // initImporter initializes the bulk subscriber importer.
-func initImporter(q *models.Queries, db *sqlx.DB, app *App) *subimporter.Importer {
+func initImporter(q *models.Queries, db *sqlx.DB, core *core.Core, app *App) *subimporter.Importer {
 	return subimporter.New(
 		subimporter.Options{
 			DomainBlocklist:    app.constants.Privacy.DomainBlocklist,
@@ -456,6 +504,9 @@ func initImporter(q *models.Queries, db *sqlx.DB, app *App) *subimporter.Importe
 			BlocklistStmt:      q.UpsertBlocklistSubscriber.Stmt,
 			UpdateListDateStmt: q.UpdateListsDate.Stmt,
 			NotifCB: func(subject string, data interface{}) error {
+				// Refresh cached subscriber counts and stats.
+				core.RefreshMatViews(true)
+
 				app.sendNotification(app.constants.NotifyEmails, subject, notifTplImport, data)
 				return nil
 			},
@@ -463,7 +514,7 @@ func initImporter(q *models.Queries, db *sqlx.DB, app *App) *subimporter.Importe
 }
 
 // initSMTPMessenger initializes the SMTP messenger.
-func initSMTPMessenger(m *manager.Manager) messenger.Messenger {
+func initSMTPMessenger(m *manager.Manager) manager.Messenger {
 	var (
 		mapKeys = ko.MapKeys("smtp")
 		servers = make([]email.Server, 0, len(mapKeys))
@@ -505,13 +556,13 @@ func initSMTPMessenger(m *manager.Manager) messenger.Messenger {
 
 // initPostbackMessengers initializes and returns all the enabled
 // HTTP postback messenger backends.
-func initPostbackMessengers(m *manager.Manager) []messenger.Messenger {
+func initPostbackMessengers(m *manager.Manager) []manager.Messenger {
 	items := ko.Slices("messengers")
 	if len(items) == 0 {
 		return nil
 	}
 
-	var out []messenger.Messenger
+	var out []manager.Messenger
 	for _, item := range items {
 		if !item.Bool("enabled") {
 			continue
@@ -545,6 +596,7 @@ func initMediaStore() media.Store {
 	case "s3":
 		var o s3.Opt
 		ko.Unmarshal("upload.s3", &o)
+
 		up, err := s3.NewS3Store(o)
 		if err != nil {
 			lo.Fatalf("error initializing s3 upload provider %s", err)
@@ -575,20 +627,7 @@ func initMediaStore() media.Store {
 // initNotifTemplates compiles and returns e-mail notification templates that are
 // used for sending ad-hoc notifications to admins and subscribers.
 func initNotifTemplates(path string, fs stuffbin.FileSystem, i *i18n.I18n, cs *constants) *notifTpls {
-	// Register utility functions that the e-mail templates can use.
-	funcs := template.FuncMap{
-		"RootURL": func() string {
-			return cs.RootURL
-		},
-		"LogoURL": func() string {
-			return cs.LogoURL
-		},
-		"L": func() *i18n.I18n {
-			return i
-		},
-	}
-
-	tpls, err := stuffbin.ParseTemplatesGlob(funcs, fs, "/static/email-templates/*.html")
+	tpls, err := stuffbin.ParseTemplatesGlob(initTplFuncs(i, cs), fs, "/static/email-templates/*.html")
 	if err != nil {
 		lo.Fatalf("error parsing e-mail notif templates: %v", err)
 	}
@@ -612,7 +651,7 @@ func initNotifTemplates(path string, fs stuffbin.FileSystem, i *i18n.I18n, cs *c
 	h := make([]byte, ln)
 	copy(h, html[0:ln])
 
-	if !bytes.Contains(bytes.ToLower(h), []byte("<!doctype html>")) {
+	if !bytes.Contains(bytes.ToLower(h), []byte("<!doctype html")) {
 		out.contentType = models.CampaignContentTypePlain
 		lo.Println("system e-mail templates are plaintext")
 	}
@@ -628,7 +667,15 @@ func initBounceManager(app *App) *bounce.Manager {
 		SESEnabled:      ko.Bool("bounce.ses_enabled"),
 		SendgridEnabled: ko.Bool("bounce.sendgrid_enabled"),
 		SendgridKey:     ko.String("bounce.sendgrid_key"),
-
+		Postmark: struct {
+			Enabled  bool
+			Username string
+			Password string
+		}{
+			ko.Bool("bounce.postmark.enabled"),
+			ko.String("bounce.postmark.username"),
+			ko.String("bounce.postmark.password"),
+		},
 		RecordBounceCB: app.core.RecordBounce,
 	}
 
@@ -659,6 +706,42 @@ func initBounceManager(app *App) *bounce.Manager {
 	return b
 }
 
+func initAbout(q *models.Queries, db *sqlx.DB) about {
+	var (
+		mem runtime.MemStats
+	)
+
+	// Memory / alloc stats.
+	runtime.ReadMemStats(&mem)
+
+	info := types.JSONText(`{}`)
+	if err := db.QueryRow(q.GetDBInfo).Scan(&info); err != nil {
+		lo.Printf("WARNING: error getting database version: %v", err)
+	}
+
+	hostname, err := os.Hostname()
+	if err != nil {
+		lo.Printf("WARNING: error getting hostname: %v", err)
+	}
+
+	return about{
+		Version:   versionString,
+		Build:     buildString,
+		GoArch:    runtime.GOARCH,
+		GoVersion: runtime.Version(),
+		Database:  info,
+		System: aboutSystem{
+			NumCPU: runtime.NumCPU(),
+		},
+		Host: aboutHost{
+			OS:       runtime.GOOS,
+			Machine:  runtime.GOARCH,
+			Hostname: hostname,
+		},
+	}
+
+}
+
 // initHTTPServer sets up and runs the app's main HTTP server and blocks forever.
 func initHTTPServer(app *App) *echo.Echo {
 	// Initialize the HTTP server.
@@ -673,19 +756,21 @@ func initHTTPServer(app *App) *echo.Echo {
 		}
 	})
 
-	// Parse and load user facing templates.
-	tpl, err := stuffbin.ParseTemplatesGlob(template.FuncMap{
-		"L": func() *i18n.I18n {
-			return app.i18n
-		}}, app.fs, "/public/templates/*.html")
+	tpl, err := stuffbin.ParseTemplatesGlob(initTplFuncs(app.i18n, app.constants), app.fs, "/public/templates/*.html")
 	if err != nil {
 		lo.Fatalf("error parsing public templates: %v", err)
 	}
 	srv.Renderer = &tplRenderer{
-		templates:  tpl,
-		RootURL:    app.constants.RootURL,
-		LogoURL:    app.constants.LogoURL,
-		FaviconURL: app.constants.FaviconURL}
+		templates:           tpl,
+		SiteName:            app.constants.SiteName,
+		RootURL:             app.constants.RootURL,
+		LogoURL:             app.constants.LogoURL,
+		FaviconURL:          app.constants.FaviconURL,
+		AssetVersion:        app.constants.AssetVersion,
+		EnablePublicSubPage: app.constants.EnablePublicSubPage,
+		EnablePublicArchive: app.constants.EnablePublicArchive,
+		IndividualTracking:  app.constants.Privacy.IndividualTracking,
+	}
 
 	// Initialize the static file server.
 	fSrv := app.fs.FileServer()
@@ -716,6 +801,28 @@ func initHTTPServer(app *App) *echo.Echo {
 	}()
 
 	return srv
+}
+
+func initCaptcha() *captcha.Captcha {
+	return captcha.New(captcha.Opt{
+		CaptchaSecret: ko.String("security.captcha_secret"),
+	})
+}
+
+func initCron(core *core.Core) {
+	c := cron.New()
+	_, err := c.Add(ko.MustString("app.cache_slow_queries_interval"), func() {
+		lo.Println("refreshing slow query cache")
+		_ = core.RefreshMatViews(true)
+		lo.Println("done refreshing slow query cache")
+	})
+	if err != nil {
+		lo.Printf("error initializing slow cache query cron: %v", err)
+		return
+	}
+
+	c.Start()
+	lo.Printf("IMPORTANT: database slow query caching is enabled. Aggregate numbers and stats will not be realtime. Next refresh at: %v", c.Entries()[0].Next)
 }
 
 func awaitReload(sigChan chan os.Signal, closerWait chan bool, closer func()) chan bool {
@@ -760,4 +867,33 @@ func joinFSPaths(root string, paths []string) []string {
 	}
 
 	return out
+}
+
+func initTplFuncs(i *i18n.I18n, cs *constants) template.FuncMap {
+	funcs := template.FuncMap{
+		"RootURL": func() string {
+			return cs.RootURL
+		},
+		"LogoURL": func() string {
+			return cs.LogoURL
+		},
+		"Date": func(layout string) string {
+			if layout == "" {
+				layout = time.ANSIC
+			}
+			return time.Now().Format(layout)
+		},
+		"L": func() *i18n.I18n {
+			return i
+		},
+		"Safe": func(safeHTML string) template.HTML {
+			return template.HTML(safeHTML)
+		},
+	}
+
+	for k, v := range sprig.GenericFuncMap() {
+		funcs[k] = v
+	}
+
+	return funcs
 }
